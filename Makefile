@@ -1,5 +1,5 @@
 TARGET = uelf
-SRC = parse.c
+SRC = uELF.c
 OBJDIR = build
 OBJ = $(OBJDIR)/$(SRC:.c=.o)
 CC = gcc

@@ -14,6 +14,9 @@
         "chrono": "c",
         "format": "c",
         "variant": "c",
-        "*.inc": "c"
+        "*.inc": "c",
+        "cstdint": "c",
+        "random": "c",
+        "compare": "c"
     }
 }
