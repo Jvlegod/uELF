@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <stdint.h>
 #include "uELF.h"
 #include "uELf_log.h"
 
@@ -16,6 +19,7 @@ static int uElf64_open(const char *name, uElf64_File *elf_file) {
   }
 
   elf_file->fd = fd;
+  elf_file->name = name;
 
   // Read ELF header
   if (read(fd, &elf_file->elf_header, sizeof(elf_file->elf_header)) != sizeof(elf_file->elf_header)) {
@@ -250,10 +254,8 @@ static int uELF64_parse_sections(uElf64_File *elf_file) {
 static int uELF64_print_symbols(uElf64_File *elf_file) {
   uElf64_Shdr *symtab_section = elf_file->symtab_section;
   uElf64_Shdr *dynsym_section = elf_file->dynsym_section;
-  uElf64_Shdr *section_headers = elf_file->section_headers;
 
   if (symtab_section && symtab_section->sh_size > 0) {
-    uElf64_Shdr *strtab_section = &section_headers[symtab_section->sh_link];
     char *strtab = elf_file->strtab;
 
     uELF_INFO("Symbol table '.symtab' contains %lu entries:",
@@ -270,7 +272,6 @@ static int uELF64_print_symbols(uElf64_File *elf_file) {
   }
 
   if (dynsym_section && dynsym_section->sh_size > 0) {
-    uElf64_Shdr *dynstr_section = &section_headers[dynsym_section->sh_link];
     char *dynstr = elf_file->dynstr;
     uELF_INFO("Symbol table '.dynsym' contains %lu entries:",
               dynsym_section->sh_size / dynsym_section->sh_entsize);
@@ -310,6 +311,7 @@ static int uELF64_parse_programs(uElf64_File *elf_file) {
       ehdr->e_phnum * sizeof(uElf64_Phdr)) {
     uELF_ERROR("Failed to read program headers");
     free(elf_file->program_headers);
+    elf_file->program_headers = NULL;
     return -1;
   }
 
@@ -324,6 +326,11 @@ static int uELF64_print_map_sections_to_segments(uElf64_File *elf_file) {
     uElf64_Shdr *shdrs = elf_file->section_headers;
     uElf64_Phdr *phdrs = elf_file->program_headers;
     const char *shstrtab = (const char *)elf_file->shstrtab;
+
+    if (!phdrs) {
+        uELF_WARN("No program headers available for mapping information");
+        return 0;
+    }
 
     uELF_INFO("Section to Segment mapping:");
 
@@ -396,40 +403,345 @@ static void uELF64_print_programs(uElf64_File *elf_file) {
     }
 }
 
+static int uelf_prot_from_flags(uint32_t flags) {
+  int prot = 0;
+  if (flags & UELF_PF_R) prot |= PROT_READ;
+  if (flags & UELF_PF_W) prot |= PROT_WRITE;
+  if (flags & UELF_PF_X) prot |= PROT_EXEC;
+  return prot;
+}
 
-int main(int argc, char **argv) {
-  if (argc < 2) {
-    uELF_ERROR("error argument");
+static int uELF64_load_segments(uElf64_File *elf_file) {
+  uElf64_Ehdr *ehdr = &elf_file->elf_header;
+
+  if (!elf_file->program_headers) {
+    uELF_ERROR("Program headers not parsed, cannot load segments");
     return -1;
   }
 
-  const char *path = argv[1];
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    page_size = 4096;
+  }
 
-  if (memcmp((void*)path, "-h", 2) == 0 || memcmp((void*)path, "--help", 6) == 0) {
-	  printf("Usage: %s <elf-file>\n", argv[0]);
-	  return 0;
+  int loadable_count = 0;
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    if (elf_file->program_headers[i].p_type == UELF_PT_LOAD &&
+        elf_file->program_headers[i].p_memsz > 0) {
+      loadable_count++;
+    }
+  }
+
+  if (loadable_count == 0) {
+    uELF_WARN("No loadable segments found");
+    return 0;
+  }
+
+  elf_file->loaded_segments = calloc(loadable_count, sizeof(void *));
+  elf_file->loaded_segment_sizes = calloc(loadable_count, sizeof(size_t));
+  if (!elf_file->loaded_segments || !elf_file->loaded_segment_sizes) {
+    uELF_ERROR("Failed to allocate memory for segment tracking");
+    free(elf_file->loaded_segments);
+    elf_file->loaded_segments = NULL;
+    free(elf_file->loaded_segment_sizes);
+    elf_file->loaded_segment_sizes = NULL;
+    return -1;
+  }
+
+  int is_pie = (ehdr->e_type == 3); // ET_DYN
+  uintptr_t base = 0;
+  uint64_t min_vaddr = UINT64_MAX;
+  uint64_t max_vaddr = 0;
+
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    uElf64_Phdr *ph = &elf_file->program_headers[i];
+    if (ph->p_type != UELF_PT_LOAD || ph->p_memsz == 0) {
+      continue;
+    }
+
+    uint64_t aligned_vaddr = uelf_align_down(ph->p_vaddr, (uint64_t)page_size);
+    uint64_t segment_end = uelf_align_up(ph->p_vaddr + ph->p_memsz, (uint64_t)page_size);
+    if (aligned_vaddr < min_vaddr) {
+      min_vaddr = aligned_vaddr;
+    }
+    if (segment_end > max_vaddr) {
+      max_vaddr = segment_end;
+    }
+  }
+
+  if (is_pie && loadable_count > 0) {
+    size_t total_size = (size_t)(max_vaddr - min_vaddr);
+    if (total_size == 0) {
+      total_size = (size_t)page_size;
+    }
+
+    void *reservation = mmap(NULL, total_size,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reservation == MAP_FAILED) {
+      uELF_ERROR("Failed to reserve address space for PIE: %s", strerror(errno));
+      free(elf_file->loaded_segments);
+      elf_file->loaded_segments = NULL;
+      free(elf_file->loaded_segment_sizes);
+      elf_file->loaded_segment_sizes = NULL;
+      return -1;
+    }
+
+    base = (uintptr_t)reservation - min_vaddr;
+    elf_file->loaded_segments[0] = reservation;
+    elf_file->loaded_segment_sizes[0] = total_size;
+    elf_file->loaded_segment_count = 1;
+  }
+
+  int segment_index = is_pie ? 1 : 0;
+
+  for (int i = 0; i < ehdr->e_phnum; i++) {
+    uElf64_Phdr *ph = &elf_file->program_headers[i];
+    if (ph->p_type != UELF_PT_LOAD || ph->p_memsz == 0) {
+      continue;
+    }
+
+    uint64_t aligned_vaddr = uelf_align_down(ph->p_vaddr, (uint64_t)page_size);
+    uint64_t segment_end = uelf_align_up(ph->p_vaddr + ph->p_memsz, (uint64_t)page_size);
+    size_t map_size = (size_t)(segment_end - aligned_vaddr);
+
+    int prot = uelf_prot_from_flags(ph->p_flags);
+
+    if (is_pie) {
+      uint8_t *segment_data = (uint8_t *)(base + ph->p_vaddr);
+      ssize_t read_bytes = pread(elf_file->fd, segment_data, ph->p_filesz, ph->p_offset);
+      if (read_bytes != (ssize_t)ph->p_filesz) {
+        uELF_ERROR("Failed to read segment %d contents", i);
+        goto fail;
+      }
+
+      if (ph->p_memsz > ph->p_filesz) {
+        size_t bss_size = (size_t)(ph->p_memsz - ph->p_filesz);
+        memset(segment_data + ph->p_filesz, 0, bss_size);
+      }
+
+      if (mprotect((void *)(base + aligned_vaddr), map_size, prot) < 0) {
+        uELF_WARN("mprotect failed for segment %d: %s", i, strerror(errno));
+      }
+
+      uELF_INFO("Loaded segment %d at 0x%lx (%zu bytes)",
+                i, (unsigned long)(base + aligned_vaddr), map_size);
+      continue;
+    }
+
+    int map_prot = prot | PROT_WRITE;
+    uintptr_t target_addr = base + aligned_vaddr;
+    void *mapping_base = mmap((void *)target_addr, map_size, map_prot,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (mapping_base == MAP_FAILED) {
+      uELF_ERROR("mmap failed for segment %d: %s", i, strerror(errno));
+      goto fail;
+    }
+
+    uint8_t *segment_data = (uint8_t *)(base + ph->p_vaddr);
+    ssize_t read_bytes = pread(elf_file->fd, segment_data, ph->p_filesz, ph->p_offset);
+    if (read_bytes != (ssize_t)ph->p_filesz) {
+      uELF_ERROR("Failed to read segment %d contents", i);
+      munmap(mapping_base, map_size);
+      goto fail;
+    }
+
+    if (ph->p_memsz > ph->p_filesz) {
+      size_t bss_size = (size_t)(ph->p_memsz - ph->p_filesz);
+      memset(segment_data + ph->p_filesz, 0, bss_size);
+    }
+
+    if ((prot & PROT_WRITE) == 0) {
+      if (mprotect(mapping_base, map_size, prot) < 0) {
+        uELF_WARN("mprotect failed for segment %d: %s", i, strerror(errno));
+      }
+    }
+
+    elf_file->loaded_segments[segment_index] = mapping_base;
+    elf_file->loaded_segment_sizes[segment_index] = map_size;
+    elf_file->loaded_segment_count++;
+    segment_index++;
+
+    uELF_INFO("Loaded segment %d at 0x%lx (%zu bytes)",
+              i, (unsigned long)(base + aligned_vaddr), map_size);
+  }
+
+  elf_file->load_base = base;
+  return 0;
+
+fail:
+  for (size_t j = 0; j < elf_file->loaded_segment_count; j++) {
+    if (elf_file->loaded_segments[j]) {
+      munmap(elf_file->loaded_segments[j], elf_file->loaded_segment_sizes[j]);
+    }
+  }
+  free(elf_file->loaded_segments);
+  elf_file->loaded_segments = NULL;
+  free(elf_file->loaded_segment_sizes);
+  elf_file->loaded_segment_sizes = NULL;
+  elf_file->loaded_segment_count = 0;
+  elf_file->load_base = 0;
+  return -1;
+}
+
+static int uELF64_lookup_symbol(uElf64_File *elf_file, const char *symbol, uint64_t *value) {
+  if (!symbol || !value) {
+    return -1;
+  }
+
+  if (elf_file->symtab_section && elf_file->symtab) {
+    uElf64_Shdr *strtab_section = elf_file->strtab_section;
+    if (strtab_section && elf_file->strtab) {
+      size_t count = elf_file->symtab_section->sh_size / elf_file->symtab_section->sh_entsize;
+      for (size_t i = 0; i < count; i++) {
+        uElf64_Sym *sym = (uElf64_Sym *)(elf_file->symtab + i * sizeof(uElf64_Sym));
+        if (sym->st_name >= strtab_section->sh_size)
+          continue;
+        const char *name = &elf_file->strtab[sym->st_name];
+        if (name && strcmp(name, symbol) == 0) {
+          *value = sym->st_value;
+          return 0;
+        }
+      }
+    }
+  }
+
+  if (elf_file->dynsym_section && elf_file->dynsym) {
+    uElf64_Shdr *dynstr_section = elf_file->dynstr_section;
+    if (dynstr_section && elf_file->dynstr) {
+      size_t count = elf_file->dynsym_section->sh_size / elf_file->dynsym_section->sh_entsize;
+      for (size_t i = 0; i < count; i++) {
+        uElf64_Sym *sym = (uElf64_Sym *)(elf_file->dynsym + i * sizeof(uElf64_Sym));
+        if (sym->st_name >= dynstr_section->sh_size)
+          continue;
+        const char *name = &elf_file->dynstr[sym->st_name];
+        if (name && strcmp(name, symbol) == 0) {
+          *value = sym->st_value;
+          return 0;
+        }
+      }
+    }
+  }
+
+  return -1;
+}
+
+static int uELF64_execute_symbol(uElf64_File *elf_file, const char *symbol) {
+  if (elf_file->elf_header.e_type == 3) {
+    uELF_WARN("Executing symbols from PIE/shared objects is not supported; rebuild the binary with -no-pie for testing");
+    return -1;
+  }
+
+  uint64_t addr = 0;
+  if (uELF64_lookup_symbol(elf_file, symbol, &addr) < 0) {
+    uELF_ERROR("Symbol '%s' not found", symbol);
+    return -1;
+  }
+
+  if (addr == 0) {
+    uELF_ERROR("Symbol '%s' has no address", symbol);
+    return -1;
+  }
+
+  addr += elf_file->load_base;
+
+  uELF_INFO("Invoking symbol '%s' at 0x%lx", symbol, (unsigned long)addr);
+
+  if (strcmp(symbol, "main") == 0) {
+    typedef int (*main_fn_t)(int, char **, char **);
+    main_fn_t fn = (main_fn_t)(uintptr_t)addr;
+    char *argv0 = (char *)(elf_file->name ? elf_file->name : "uelf-loaded");
+    char *argv_list[] = { argv0, NULL };
+    int ret = fn(1, argv_list, NULL);
+    uELF_INFO("Function 'main' returned %d", ret);
+  } else {
+    typedef void (*fn_t)(void);
+    fn_t fn = (fn_t)(uintptr_t)addr;
+    fn();
+    uELF_INFO("Function '%s' finished execution", symbol);
+  }
+
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    printf("Usage: %s [--load|-l] <elf-file> [symbol]\n", argv[0]);
+    return -1;
+  }
+
+  if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+    printf("Usage: %s [--load|-l] <elf-file> [symbol]\n", argv[0]);
+    return 0;
+  }
+
+  int load_mode = 0;
+  const char *entry_symbol = NULL;
+  const char *path = NULL;
+
+  if (strcmp(argv[1], "--load") == 0 || strcmp(argv[1], "-l") == 0) {
+    load_mode = 1;
+    if (argc < 3) {
+      uELF_ERROR("Missing ELF file path for load mode");
+      return -1;
+    }
+    path = argv[2];
+    if (argc >= 4) {
+      entry_symbol = argv[3];
+    }
+    if (argc > 4) {
+      uELF_WARN("Ignoring extra arguments after symbol name");
+    }
+  } else {
+    path = argv[1];
+    if (argc > 2) {
+      uELF_WARN("Ignoring extra arguments without --load option");
+    }
   }
 
   uElf64_File elf_file;
   memset(&elf_file, 0, sizeof(elf_file));
+  elf_file.fd = -1;
 
   if (uElf64_open(path, &elf_file) < 0) {
 	  uELF_ERROR("Failed to open ELF file: %s", path);
 	  return -1;
   }
+
+  int ret = 0;
+
   uELF64_print_header(&elf_file);
   
-  uELF64_parse_sections(&elf_file);
+  if (uELF64_parse_sections(&elf_file) < 0) {
+    ret = -1;
+    goto close;
+  }
   uELF64_print_sections(&elf_file);
 
   uELF64_print_symbols(&elf_file);
 
-  uELF64_parse_programs(&elf_file);
+  if (uELF64_parse_programs(&elf_file) < 0) {
+    ret = -1;
+    goto close;
+  }
   uELF64_print_programs(&elf_file);
   uELF64_print_map_sections_to_segments(&elf_file);
+
+  if (load_mode) {
+    if (uELF64_load_segments(&elf_file) == 0) {
+      uELF_INFO("ELF entry point: 0x%lx", elf_file.elf_header.e_entry);
+      if (entry_symbol) {
+        if (uELF64_execute_symbol(&elf_file, entry_symbol) < 0) {
+          ret = -1;
+        }
+      }
+    } else {
+      ret = -1;
+    }
+  }
 
 close:
   uElf64_close(&elf_file);
 
-  return 0;
+  return ret;
 }

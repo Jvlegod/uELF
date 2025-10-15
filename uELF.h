@@ -8,6 +8,10 @@ typedef enum {
 	EXEC
 } File_Type;
 
+#define UELF_PF_X 0x1
+#define UELF_PF_W 0x2
+#define UELF_PF_R 0x4
+
 typedef enum {
     UELF_SHT_NULL        = 0,          // 无效节
     UELF_SHT_PROGBITS    = 1,          // 程序数据
@@ -114,7 +118,7 @@ typedef struct {
 	File_Type type;
 	uElf64_Ehdr elf_header;
   uElf64_Shdr *section_headers;
-  uElf64_Shdr *program_headers;
+  uElf64_Phdr *program_headers;
 
   uElf64_Shdr *shstrtab_section; // 节名字符串表节
   char *shstrtab;                // 节名字符串表内容
@@ -127,6 +131,11 @@ typedef struct {
   char *symtab;                // 符号表内容
   uElf64_Shdr *dynsym_section; // 动态符号表节
   char *dynsym;                // 动态符号表内容
+
+  void **loaded_segments;      // 已加载段的基地址
+  size_t *loaded_segment_sizes;// 已加载段的大小
+  size_t loaded_segment_count; // 已加载段数量
+  uintptr_t load_base;         // 加载基址（用于 PIE ）
 } uElf64_File;
 
 static const char *uelf_class_name(uint8_t c) {
@@ -172,4 +181,12 @@ static const char *uelf_machine_name(uint16_t m) {
         case 0xF3: return "RISC-V";
         default: return "Other";
     }
+}
+
+static uint64_t uelf_align_down(uint64_t value, uint64_t alignment) {
+  return value & ~(alignment - 1);
+}
+
+static uint64_t uelf_align_up(uint64_t value, uint64_t alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
 }
