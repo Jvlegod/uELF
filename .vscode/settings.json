@@ -17,6 +17,8 @@
         "*.inc": "c",
         "cstdint": "c",
         "random": "c",
-        "compare": "c"
+        "compare": "c",
+        "bitset": "c",
+        "algorithm": "c"
     }
 }

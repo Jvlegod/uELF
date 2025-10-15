@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <stdint.h>
+#include <dlfcn.h>
 #include "uELF.h"
 #include "uELf_log.h"
 
@@ -43,12 +44,26 @@ static int uElf64_close(uElf64_File *elf_file) {
 	  elf_file->fd = -1;
   }
 
-  for (int i = 0; i < elf_file->elf_header.e_shnum; i++) {
-    if (elf_file->section_headers) {
-      free(elf_file->section_headers);
-      elf_file->section_headers = NULL;
+  if (elf_file->loaded_segments) {
+    for (size_t i = 0; i < elf_file->loaded_segment_count; i++) {
+      if (elf_file->loaded_segments[i]) {
+        munmap(elf_file->loaded_segments[i], elf_file->loaded_segment_sizes[i]);
+      }
     }
+    free(elf_file->loaded_segments);
+    elf_file->loaded_segments = NULL;
   }
+
+  if (elf_file->loaded_segment_sizes) {
+    free(elf_file->loaded_segment_sizes);
+    elf_file->loaded_segment_sizes = NULL;
+  }
+  elf_file->loaded_segment_count = 0;
+
+  free(elf_file->section_headers);
+  elf_file->section_headers = NULL;
+  free(elf_file->program_headers);
+  elf_file->program_headers = NULL;
 
   free(elf_file->shstrtab);
   elf_file->shstrtab = NULL;
@@ -319,7 +334,7 @@ static int uELF64_parse_programs(uElf64_File *elf_file) {
 }
 
 // 如果某个 section 的文件范围 [sh_offset, sh_offset + sh_size)
-// 完全在某个 segment 的范围 [p_offset, p_offset + p_filesz)** 内，
+// 完全在某个 segment 的范围 [p_offset, p_offset + p_filesz] 内，
 // 那么这个 section 属于该 segment.
 static int uELF64_print_map_sections_to_segments(uElf64_File *elf_file) {
     uElf64_Ehdr *ehdr = &elf_file->elf_header;
@@ -458,7 +473,7 @@ static int uELF64_load_segments(uElf64_File *elf_file) {
     if (ph->p_type != UELF_PT_LOAD || ph->p_memsz == 0) {
       continue;
     }
-
+    // 操作系统的内存映射（mmap, mprotect 等）必须以页为单位操作. 如果不对齐，会导致保护或映射错误.
     uint64_t aligned_vaddr = uelf_align_down(ph->p_vaddr, (uint64_t)page_size);
     uint64_t segment_end = uelf_align_up(ph->p_vaddr + ph->p_memsz, (uint64_t)page_size);
     if (aligned_vaddr < min_vaddr) {
@@ -626,12 +641,199 @@ static int uELF64_lookup_symbol(uElf64_File *elf_file, const char *symbol, uint6
   return -1;
 }
 
-static int uELF64_execute_symbol(uElf64_File *elf_file, const char *symbol) {
-  if (elf_file->elf_header.e_type == 3) {
-    uELF_WARN("Executing symbols from PIE/shared objects is not supported; rebuild the binary with -no-pie for testing");
+static int uELF64_resolve_symbol_address(uElf64_File *elf_file,
+                                         const uElf64_Sym *sym,
+                                         const char *name,
+                                         uint64_t *value) {
+  if (!sym || !value) {
     return -1;
   }
 
+  if (sym->st_shndx != 0 && sym->st_shndx < 0xff00) {
+    *value = elf_file->load_base + sym->st_value;
+    return 0;
+  }
+
+  if (!name || name[0] == '\0') {
+    if (UELF64_ST_BIND(sym->st_info) == UELF_STB_WEAK) {
+      *value = 0;
+      return 0;
+    }
+    return -1;
+  }
+
+  dlerror();
+  void *addr = dlsym(RTLD_DEFAULT, name);
+  const char *err = dlerror();
+  if (err != NULL || addr == NULL) {
+    if (UELF64_ST_BIND(sym->st_info) == UELF_STB_WEAK) {
+      uELF_WARN("Leaving weak external symbol '%s' unresolved", name);
+      *value = 0;
+      return 0;
+    }
+    uELF_ERROR("Failed to resolve external symbol '%s': %s", name,
+               err ? err : "unknown error");
+    return -1;
+  }
+
+  *value = (uint64_t)(uintptr_t)addr;
+  return 0;
+}
+
+static int uELF64_x86_64_relocate(uElf64_File *elf_file, uElf64_Rela *relocs, size_t count,
+                                  uElf64_Shdr *symtab_section, char *symtab_data,
+                                  char *strtab_data, size_t strtab_size, size_t sym_entsize) {
+  for (size_t rel_idx = 0; rel_idx < count; rel_idx++) {
+    uElf64_Rela *rela = &relocs[rel_idx];
+    uint32_t type = UELF64_R_TYPE(rela->r_info);
+    uint32_t sym_index = UELF64_R_SYM(rela->r_info);
+    uintptr_t target = elf_file->load_base + rela->r_offset;
+
+    uint64_t value = 0;
+    const uElf64_Sym *sym = NULL;
+    const char *name = NULL;
+
+    if (sym_index != 0 && symtab_data) {
+      size_t symtab_size = symtab_section->sh_size;
+      size_t offset = (size_t)sym_index * sym_entsize;
+      if (offset + sym_entsize <= symtab_size) {
+        sym = (const uElf64_Sym *)(symtab_data + offset);
+        if (sym && sym->st_name && strtab_data && (size_t)sym->st_name < strtab_size) {
+          name = strtab_data + sym->st_name;
+        }
+      } else {
+        uELF_ERROR("Relocation references invalid symbol index %u", sym_index);
+        free(relocs);
+        return -1;
+      }
+    }
+
+    switch (type) {
+      case UELF_R_X86_64_RELATIVE:
+        *(uint64_t *)target = elf_file->load_base + rela->r_addend;
+        break;
+      case UELF_R_X86_64_GLOB_DAT:
+      case UELF_R_X86_64_JUMP_SLOT:
+        if (!sym) {
+          uELF_ERROR("Relocation requires symbol but none provided (index %u)", sym_index);
+          free(relocs);
+          return -1;
+        }
+        if (uELF64_resolve_symbol_address(elf_file, sym, name, &value) < 0) {
+          free(relocs);
+          return -1;
+        }
+        *(uint64_t *)target = value;
+        break;
+      case UELF_R_X86_64_64:
+        if (!sym) {
+          uELF_ERROR("Relocation requires symbol but none provided (index %u)", sym_index);
+          free(relocs);
+          return -1;
+        }
+        if (uELF64_resolve_symbol_address(elf_file, sym, name, &value) < 0) {
+          free(relocs);
+          return -1;
+        }
+        *(uint64_t *)target = value + rela->r_addend;
+        break;
+      case UELF_R_X86_64_NONE:
+        break;
+      default:
+        uELF_WARN("Unsupported relocation type %u at offset 0x%lx", type,
+                  (unsigned long)rela->r_offset);
+        break;
+    }
+  }
+}
+
+static int uELF64_arch_relocate(uElf64_File *elf_file, uElf64_Rela *relocs, size_t count,
+                                uElf64_Shdr *symtab_section, char *symtab_data,
+                                char *strtab_data, size_t strtab_size, size_t sym_entsize) {
+  switch (elf_file->elf_header.e_machine)
+  {
+  case 0x3E: // EM_X86_64
+    return uELF64_x86_64_relocate(elf_file, relocs, count, symtab_section, symtab_data,
+                                   strtab_data, strtab_size, sym_entsize);
+  default:
+    return -1;
+  }
+  return -1;
+}
+
+static int uELF64_apply_relocations(uElf64_File *elf_file) {
+  if (!elf_file->section_headers) {
+    return 0;
+  }
+
+  for (int i = 0; i < elf_file->elf_header.e_shnum; i++) {
+    uElf64_Shdr *sh = &elf_file->section_headers[i];
+    // "All relocations for the AMD64 architecture use the ELF64_Rela structure.
+    // Entries of type Elf64_Rel are not used."
+    if (sh->sh_type != UELF_SHT_RELA || sh->sh_size == 0) {
+      continue;
+    }
+
+    size_t count = sh->sh_entsize ? (sh->sh_size / sh->sh_entsize)
+                                  : (sh->sh_size / sizeof(uElf64_Rela));
+    if (count == 0) {
+      continue;
+    }
+
+    uElf64_Rela *relocs = malloc(sh->sh_size);
+    if (!relocs) {
+      uELF_ERROR("Failed to allocate memory for relocation section %d", i);
+      return -1;
+    }
+
+    if (pread(elf_file->fd, relocs, sh->sh_size, sh->sh_offset) != (ssize_t)sh->sh_size) {
+      uELF_ERROR("Failed to read relocation section %d", i);
+      free(relocs);
+      return -1;
+    }
+
+    if (sh->sh_link >= elf_file->elf_header.e_shnum) {
+      uELF_ERROR("Relocation section %d references invalid symbol table", i);
+      free(relocs);
+      return -1;
+    }
+
+    uElf64_Shdr *symtab_section = &elf_file->section_headers[sh->sh_link];
+    char *symtab_data = NULL;
+    char *strtab_data = NULL;
+    size_t sym_entsize = symtab_section->sh_entsize ? symtab_section->sh_entsize
+                                                    : sizeof(uElf64_Sym);
+    size_t strtab_size = 0;
+
+    if (symtab_section == elf_file->symtab_section && elf_file->symtab) {
+      symtab_data = elf_file->symtab;
+      strtab_data = elf_file->strtab;
+      if (elf_file->strtab_section) {
+        strtab_size = elf_file->strtab_section->sh_size;
+      }
+    } else if (symtab_section == elf_file->dynsym_section && elf_file->dynsym) {
+      symtab_data = elf_file->dynsym;
+      strtab_data = elf_file->dynstr;
+      if (elf_file->dynstr_section) {
+        strtab_size = elf_file->dynstr_section->sh_size;
+      }
+    } else {
+      uELF_WARN("Skipping relocation section %d: unsupported symbol table index %u",
+                i, sh->sh_link);
+      free(relocs);
+      continue;
+    }
+
+    uELF64_arch_relocate(elf_file, relocs, count, symtab_section, symtab_data,
+                       strtab_data, strtab_size, sym_entsize);
+
+    free(relocs);
+  }
+
+  return 0;
+}
+
+static int uELF64_execute_symbol(uElf64_File *elf_file, const char *symbol) {
   uint64_t addr = 0;
   if (uELF64_lookup_symbol(elf_file, symbol, &addr) < 0) {
     uELF_ERROR("Symbol '%s' not found", symbol);
@@ -666,12 +868,12 @@ static int uELF64_execute_symbol(uElf64_File *elf_file, const char *symbol) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    printf("Usage: %s [--load|-l] <elf-file> [symbol]\n", argv[0]);
+    printf("Usage: %s [--load|-l|--print|-p] <elf-file> [symbol]\n", argv[0]);
     return -1;
   }
 
   if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-    printf("Usage: %s [--load|-l] <elf-file> [symbol]\n", argv[0]);
+    printf("Usage: %s [--load|-l|--print|-p] <elf-file> [symbol]\n", argv[0]);
     return 0;
   }
 
@@ -692,11 +894,18 @@ int main(int argc, char **argv) {
     if (argc > 4) {
       uELF_WARN("Ignoring extra arguments after symbol name");
     }
-  } else {
-    path = argv[1];
-    if (argc > 2) {
-      uELF_WARN("Ignoring extra arguments without --load option");
+  } else if (strcmp(argv[1], "--print") == 0 || strcmp(argv[1], "-p") == 0) {
+    if (argc < 3) {
+      uELF_ERROR("Missing ELF file path for print mode");
+      return -1;
     }
+    path = argv[2];
+    if (argc > 3) {
+      uELF_WARN("Ignoring extra arguments in print mode");
+    }
+  } else {
+    uELF_ERROR("Unknown option: %s", argv[1]);
+    return -1;
   }
 
   uElf64_File elf_file;
@@ -710,27 +919,33 @@ int main(int argc, char **argv) {
 
   int ret = 0;
 
-  uELF64_print_header(&elf_file);
   
   if (uELF64_parse_sections(&elf_file) < 0) {
     ret = -1;
     goto close;
   }
-  uELF64_print_sections(&elf_file);
 
-  uELF64_print_symbols(&elf_file);
-
+  
   if (uELF64_parse_programs(&elf_file) < 0) {
     ret = -1;
     goto close;
   }
-  uELF64_print_programs(&elf_file);
-  uELF64_print_map_sections_to_segments(&elf_file);
+
+  if (strcmp(argv[1], "--print") == 0 || strcmp(argv[1], "-p") == 0) {
+    uELF64_print_header(&elf_file);
+    uELF64_print_sections(&elf_file);
+    uELF64_print_symbols(&elf_file);
+    uELF64_print_programs(&elf_file);
+    uELF64_print_map_sections_to_segments(&elf_file);
+    goto close;
+  }
 
   if (load_mode) {
     if (uELF64_load_segments(&elf_file) == 0) {
       uELF_INFO("ELF entry point: 0x%lx", elf_file.elf_header.e_entry);
-      if (entry_symbol) {
+      if (uELF64_apply_relocations(&elf_file) < 0) {
+        ret = -1;
+      } else if (entry_symbol) {
         if (uELF64_execute_symbol(&elf_file, entry_symbol) < 0) {
           ret = -1;
         }

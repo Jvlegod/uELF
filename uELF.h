@@ -57,10 +57,33 @@ typedef enum {
     UELF_PT_SUNWBSS     = 0x6ffffffa, // Sun 特定 BSS 段
     UELF_PT_SUNWSTACK   = 0x6ffffffb, // Sun 栈段
 
-    // 处理器特定范围
     UELF_PT_LOPROC      = 0x70000000, // 处理器特定范围下限
     UELF_PT_HIPROC      = 0x7fffffff  // 处理器特定范围上限
 } uELF_ProgramType;
+
+typedef struct {
+  uint64_t r_offset;
+  uint64_t r_info;
+  int64_t r_addend;
+} uElf64_Rela;
+
+#define UELF64_R_SYM(i) ((uint32_t)((i) >> 32))
+#define UELF64_R_TYPE(i) ((uint32_t)(i))
+
+#define UELF64_ST_BIND(i) ((uint8_t)((i) >> 4))
+#define UELF64_ST_TYPE(i) ((uint8_t)((i) & 0xf))
+
+#define UELF_STB_LOCAL  0
+#define UELF_STB_GLOBAL 1
+#define UELF_STB_WEAK   2
+
+#define UELF_SHN_UNDEF 0
+
+#define UELF_R_X86_64_NONE      0
+#define UELF_R_X86_64_64        1
+#define UELF_R_X86_64_GLOB_DAT  6
+#define UELF_R_X86_64_JUMP_SLOT 7
+#define UELF_R_X86_64_RELATIVE  8
 
 typedef struct {
     uint32_t p_type;   // 段类型 (Segment type)
