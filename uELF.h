@@ -34,6 +34,15 @@ typedef enum {
 } uELF_ShdrType;
 
 typedef struct {
+    uint32_t st_name;  // 符号名在字符串表中的偏移
+    uint8_t  st_info;  // 类型 + 绑定信息
+    uint8_t  st_other; // 可见性
+    uint16_t st_shndx; // 该符号所在节索引
+    uint64_t st_value; // 符号值（地址/偏移）
+    uint64_t st_size;  // 符号大小（例如函数长度）
+} uElf64_Sym;
+
+typedef struct {
   unsigned char e_ident[16]; // 魔数 + 文件类型
   uint16_t e_type;           // 文件类型 (ET_EXEC, ET_DYN, ET_REL)
   uint16_t e_machine;        // 架构类型 (EM_X86_64, EM_RISCV, etc.)
@@ -72,6 +81,15 @@ typedef struct {
 
   uElf64_Shdr *shstrtab_section; // 节名字符串表节
   char *shstrtab;                // 节名字符串表内容
+  uElf64_Shdr *strtab_section;  // 字符串表节
+  char *strtab;                 // 字符串表内容
+  uElf64_Shdr *dynstr_section; // 动态字符串表节
+  char *dynstr;                // 动态字符串表内容
+
+  uElf64_Shdr *symtab_section; // 符号表节
+  char *symtab;                // 符号表内容
+  uElf64_Shdr *dynsym_section; // 动态符号表节
+  char *dynsym;                // 动态符号表内容
 } uElf64_File;
 
 static const char *uelf_class_name(uint8_t c) {

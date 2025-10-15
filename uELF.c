@@ -8,7 +8,7 @@
 #include "uELf_log.h"
 
 // open file and read ELF header
-static int Elf64_open(const char *name, uElf64_File *elf_file) {
+static int uElf64_open(const char *name, uElf64_File *elf_file) {
   int fd = open(name, O_RDWR);
   if (fd < 0) {
     uELF_ERROR("Failed to open file: %s", name);
@@ -33,11 +33,26 @@ static int Elf64_open(const char *name, uElf64_File *elf_file) {
   return fd;
 }
 
-static int Elf64_close(uElf64_File *elf_file) {
+static int uElf64_close(uElf64_File *elf_file) {
   if (elf_file->fd >= 0) {
 	  close(elf_file->fd);
 	  elf_file->fd = -1;
   }
+
+  for (int i = 0; i < elf_file->elf_header.e_shnum; i++) {
+    if (elf_file->section_headers) {
+      free(elf_file->section_headers);
+      elf_file->section_headers = NULL;
+    }
+  }
+
+  free(elf_file->shstrtab);
+  elf_file->shstrtab = NULL;
+  free(elf_file->symtab);
+  elf_file->symtab = NULL;
+  free(elf_file->dynsym);
+  elf_file->dynsym = NULL;
+
   return 0;
 }
 
@@ -137,23 +152,142 @@ static int uELF64_parse_sections(uElf64_File *elf_file) {
   elf_file->shstrtab = malloc(elf_file->shstrtab_section->sh_size);
   if (!elf_file->shstrtab) {
     uELF_ERROR("Failed to allocate memory for section header string table");
-    free(elf_file->section_headers);
     return -1;
   }
 
   if (lseek(fd, elf_file->shstrtab_section->sh_offset, SEEK_SET) < 0) {
-      uELF_ERROR("lseek failed when reading .shstrtab");
-      return -1;
+    uELF_ERROR("lseek failed when reading .shstrtab");
+    return -1;
   }
 
   if (read(fd, elf_file->shstrtab, elf_file->shstrtab_section->sh_size) !=
-      (ssize_t)elf_file->shstrtab_section->sh_size) {
-      uELF_ERROR("read failed when reading .shstrtab");
+    (ssize_t)elf_file->shstrtab_section->sh_size) {
+    uELF_ERROR("read failed when reading .shstrtab");
+    return -1;
+  }
+
+  //parse symbol table if exists
+  for (int i = 0; i < elf_file->elf_header.e_shnum; i++) {
+    if (elf_file->section_headers[i].sh_type == UELF_SHT_SYMTAB) {
+      elf_file->symtab_section = &elf_file->section_headers[i];
+      elf_file->symtab = malloc(elf_file->section_headers[i].sh_size);
+      if (!elf_file->symtab) {
+        uELF_ERROR("Failed to allocate memory for symbol table");
+        return -1;
+      }
+
+      lseek(fd, elf_file->symtab_section->sh_offset, SEEK_SET);
+      if (read(fd, elf_file->symtab, elf_file->section_headers[i].sh_size) !=
+          (ssize_t)elf_file->section_headers[i].sh_size) {
+        uELF_ERROR("Failed to read symbol table");
+        free(elf_file->symtab);
+        return -1;
+      }
+    } else if (elf_file->section_headers[i].sh_type == UELF_SHT_DYNSYM) {
+      elf_file->dynsym_section = &elf_file->section_headers[i];
+      elf_file->dynsym = malloc(elf_file->section_headers[i].sh_size);
+      if (!elf_file->dynsym) {
+        uELF_ERROR("Failed to allocate memory for dynamic symbol table");
+        return -1;
+      }
+
+      lseek(fd, elf_file->dynsym_section->sh_offset, SEEK_SET);
+      if (read(fd, elf_file->dynsym, elf_file->section_headers[i].sh_size) !=
+          (ssize_t)elf_file->section_headers[i].sh_size) {
+        uELF_ERROR("Failed to read dynamic symbol table");
+        free(elf_file->dynsym);
+        return -1;
+      }
+    }
+  }
+
+  // parse static symbol table if exists
+  if (elf_file->symtab_section) {
+    elf_file->strtab_section = &elf_file->section_headers[elf_file->symtab_section->sh_link];
+    elf_file->strtab = malloc(elf_file->strtab_section->sh_size);
+    if (!elf_file->strtab) {
+      uELF_ERROR("Failed to allocate memory for string table");
       return -1;
+    }
+  
+    if (lseek(fd, elf_file->strtab_section->sh_offset, SEEK_SET) < 0) {
+      uELF_ERROR("lseek failed when reading .strtab");
+      return -1;
+    }
+  
+    if (read(fd, elf_file->strtab, elf_file->strtab_section->sh_size) !=
+      (ssize_t)elf_file->strtab_section->sh_size) {
+      uELF_ERROR("read failed when reading .strtab");
+      return -1;
+    }
+  }
+
+  // parse dynamic symbol table if exists
+  if (elf_file->dynsym_section) {
+    elf_file->dynstr_section = &elf_file->section_headers[elf_file->dynsym_section->sh_link];
+    elf_file->dynstr = malloc(elf_file->dynstr_section->sh_size);
+    if (!elf_file->dynstr) {
+      uELF_ERROR("Failed to allocate memory for dynamic string table");
+      return -1;
+    }
+  
+    if (lseek(fd, elf_file->dynstr_section->sh_offset, SEEK_SET) < 0) {
+      uELF_ERROR("lseek failed when reading .dynstr");
+      return -1;
+    }
+  
+    if (read(fd, elf_file->dynstr, elf_file->dynstr_section->sh_size) !=
+      (ssize_t)elf_file->dynstr_section->sh_size) {
+      uELF_ERROR("read failed when reading .dynstr");
+      return -1;
+    }
+  }
+
+
+  return 0;
+}
+
+static int uELF64_print_symbols(uElf64_File *elf_file) {
+  uElf64_Shdr *symtab_section = elf_file->symtab_section;
+  uElf64_Shdr *dynsym_section = elf_file->dynsym_section;
+  uElf64_Shdr *section_headers = elf_file->section_headers;
+
+  if (symtab_section && symtab_section->sh_size > 0) {
+    uElf64_Shdr *strtab_section = &section_headers[symtab_section->sh_link];
+    char *strtab = elf_file->strtab;
+
+    uELF_INFO("Symbol table '.symtab' contains %lu entries:",
+              symtab_section->sh_size / symtab_section->sh_entsize);
+    for (int i = 0; i < symtab_section->sh_size / symtab_section->sh_entsize; i++) {
+      uElf64_Sym *sym = (uElf64_Sym *)(elf_file->symtab + i * sizeof(uElf64_Sym));
+      const char *name = sym->st_name ? &strtab[sym->st_name] : "";
+      uELF_INFO("  [%2d] Value: %016lx Size: %lu Info: %02x Other: %02x Shndx: %04x Name: %s",
+                i, sym->st_value, sym->st_size, sym->st_info,
+                sym->st_other, sym->st_shndx, name);
+    }
+  } else {
+    uELF_INFO("No .symtab section found.");
+  }
+
+  if (dynsym_section && dynsym_section->sh_size > 0) {
+    uElf64_Shdr *dynstr_section = &section_headers[dynsym_section->sh_link];
+    char *dynstr = elf_file->dynstr;
+    uELF_INFO("Symbol table '.dynsym' contains %lu entries:",
+              dynsym_section->sh_size / dynsym_section->sh_entsize);
+    for (int i = 0; i < dynsym_section->sh_size / dynsym_section->sh_entsize; i++) {
+      uElf64_Sym *sym = (uElf64_Sym *)(elf_file->dynsym + i * sizeof(uElf64_Sym));
+      const char *name = sym->st_name ? &dynstr[sym->st_name] : "";
+      uELF_INFO("  [%2d] Value: %016lx Size: %lu Info: %02x Other: %02x Shndx: %04x Name: %s",
+                i, sym->st_value, sym->st_size, sym->st_info,
+                sym->st_other, sym->st_shndx, name);
+    }
+  } else {
+    uELF_INFO("No .dynsym section found.");
   }
 
   return 0;
 }
+
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -164,24 +298,26 @@ int main(int argc, char **argv) {
   const char *path = argv[1];
 
   if (memcmp((void*)path, "-h", 2) == 0 || memcmp((void*)path, "--help", 6) == 0) {
-	printf("Usage: %s <elf-file>\n", argv[0]);
-	return 0;
+	  printf("Usage: %s <elf-file>\n", argv[0]);
+	  return 0;
   }
 
   uElf64_File elf_file;
   memset(&elf_file, 0, sizeof(elf_file));
 
-  if (Elf64_open(path, &elf_file) < 0) {
-	uELF_ERROR("Failed to open ELF file: %s", path);
-	return -1;
+  if (uElf64_open(path, &elf_file) < 0) {
+	  uELF_ERROR("Failed to open ELF file: %s", path);
+	  return -1;
   }
   uELF64_print_header(&elf_file);
   
   uELF64_parse_sections(&elf_file);
   uELF64_print_sections(&elf_file);
 
+  uELF64_print_symbols(&elf_file);
+
 close:
-  Elf64_close(&elf_file);
+  uElf64_close(&elf_file);
 
   return 0;
 }
