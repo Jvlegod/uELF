@@ -33,6 +33,42 @@ typedef enum {
     UELF_SHT_HIPROC      = 0x7fffffff
 } uELF_ShdrType;
 
+typedef enum {
+    UELF_PT_NULL        = 0,          // 无效段，占位用
+    UELF_PT_LOAD        = 1,          // 可加载段 (.text, .data 等)
+    UELF_PT_DYNAMIC     = 2,          // 动态链接信息段 (.dynamic)
+    UELF_PT_INTERP      = 3,          // 解释器路径段 (.interp)
+    UELF_PT_NOTE        = 4,          // 注释段 (.note)
+    UELF_PT_SHLIB       = 5,          // 保留（很少使用）
+    UELF_PT_PHDR        = 6,          // 程序头表本身
+    UELF_PT_TLS         = 7,          // 线程局部存储段 (.tdata, .tbss)
+
+    // 系统/平台特定范围
+    UELF_PT_LOOS        = 0x60000000, // OS 特定范围下限
+    UELF_PT_GNU_EH_FRAME= 0x6474e550, // GNU 异常处理段 (.eh_frame_hdr)
+    UELF_PT_GNU_STACK   = 0x6474e551, // GNU 栈属性段（标记栈是否可执行）
+    UELF_PT_GNU_RELRO   = 0x6474e552, // GNU 只读段（relro 保护区）
+    UELF_PT_GNU_PROPERTY= 0x6474e553, // GNU 属性段
+    UELF_PT_LOSUNW      = 0x6ffffffa, // Sun/UNIX 特定段
+    UELF_PT_SUNWBSS     = 0x6ffffffa, // Sun 特定 BSS 段
+    UELF_PT_SUNWSTACK   = 0x6ffffffb, // Sun 栈段
+
+    // 处理器特定范围
+    UELF_PT_LOPROC      = 0x70000000, // 处理器特定范围下限
+    UELF_PT_HIPROC      = 0x7fffffff  // 处理器特定范围上限
+} uELF_ProgramType;
+
+typedef struct {
+    uint32_t p_type;   // 段类型 (Segment type)
+    uint32_t p_flags;  // 段标志 (Segment flags)
+    uint64_t p_offset; // 文件中的偏移量
+    uint64_t p_vaddr;  // 虚拟地址 (加载到内存中的地址)
+    uint64_t p_paddr;  // 物理地址 (通常在系统中不用)
+    uint64_t p_filesz; // 段在文件中的大小
+    uint64_t p_memsz;  // 段在内存中的大小
+    uint64_t p_align;  // 段的对齐约束
+} uElf64_Phdr;
+
 typedef struct {
     uint32_t st_name;  // 符号名在字符串表中的偏移
     uint8_t  st_info;  // 类型 + 绑定信息
@@ -44,7 +80,7 @@ typedef struct {
 
 typedef struct {
   unsigned char e_ident[16]; // 魔数 + 文件类型
-  uint16_t e_type;           // 文件类型 (ET_EXEC, ET_DYN, ET_REL)
+  uint16_t e_type;           // 文件类型 (ET_EXEC, ET_DYN, ET_REL, ET_CORE)
   uint16_t e_machine;        // 架构类型 (EM_X86_64, EM_RISCV, etc.)
   uint32_t e_version;        // ELF 版本 (一般是 1)
   uint64_t e_entry;          // 程序入口地址
@@ -78,6 +114,7 @@ typedef struct {
 	File_Type type;
 	uElf64_Ehdr elf_header;
   uElf64_Shdr *section_headers;
+  uElf64_Shdr *program_headers;
 
   uElf64_Shdr *shstrtab_section; // 节名字符串表节
   char *shstrtab;                // 节名字符串表内容

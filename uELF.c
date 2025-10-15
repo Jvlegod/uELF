@@ -288,6 +288,114 @@ static int uELF64_print_symbols(uElf64_File *elf_file) {
   return 0;
 }
 
+static int uELF64_parse_programs(uElf64_File *elf_file) {
+  uElf64_Ehdr *ehdr = &elf_file->elf_header;
+  int fd = elf_file->fd;
+
+  if (ehdr->e_phnum == 0) {
+    uELF_INFO("No program headers.");
+    return 0;
+  }
+
+  // Allocate memory for program headers
+  elf_file->program_headers = malloc(ehdr->e_phnum * sizeof(uElf64_Phdr));
+  if (!elf_file->program_headers) {
+    uELF_ERROR("Failed to allocate memory for program headers");
+    return -1;
+  }
+
+  // Read program headers
+  lseek(fd, ehdr->e_phoff, SEEK_SET);
+  if (read(fd, elf_file->program_headers, ehdr->e_phnum * sizeof(uElf64_Phdr)) !=
+      ehdr->e_phnum * sizeof(uElf64_Phdr)) {
+    uELF_ERROR("Failed to read program headers");
+    free(elf_file->program_headers);
+    return -1;
+  }
+
+  return 0;
+}
+
+// 如果某个 section 的文件范围 [sh_offset, sh_offset + sh_size)
+// 完全在某个 segment 的范围 [p_offset, p_offset + p_filesz)** 内，
+// 那么这个 section 属于该 segment.
+static int uELF64_print_map_sections_to_segments(uElf64_File *elf_file) {
+    uElf64_Ehdr *ehdr = &elf_file->elf_header;
+    uElf64_Shdr *shdrs = elf_file->section_headers;
+    uElf64_Phdr *phdrs = elf_file->program_headers;
+    const char *shstrtab = (const char *)elf_file->shstrtab;
+
+    uELF_INFO("Section to Segment mapping:");
+
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        uElf64_Phdr *ph = &phdrs[i];
+
+        uELF_INFO("   %02d     ", i);
+        int found = 0;
+
+        for (int j = 0; j < ehdr->e_shnum; j++) {
+            uElf64_Shdr *sh = &shdrs[j];
+
+            if (sh->sh_size == 0 || sh->sh_type == 0)
+                continue;
+          
+            if (sh->sh_offset >= ph->p_offset &&
+                (sh->sh_offset + sh->sh_size) <= (ph->p_offset + ph->p_filesz)) {
+
+                const char *sec_name = shstrtab + sh->sh_name;
+                uELF_INFO("%s ", sec_name);
+                found = 1;
+            }
+        }
+
+        if (!found)
+            uELF_INFO(" ");
+    }
+
+    return 0;
+}
+
+static void uELF64_print_programs(uElf64_File *elf_file) {
+    uElf64_Ehdr *ehdr = &elf_file->elf_header;
+    uElf64_Phdr *phdrs = elf_file->program_headers;
+
+    if (ehdr->e_phnum == 0) {
+      uELF_INFO("No program headers.");
+      return;
+    }
+
+    uELF_INFO("Program Headers (all %d):", ehdr->e_phnum);
+    uELF_INFO("  [Idx] Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align");
+
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        const char *type_name;
+
+        switch (phdrs[i].p_type) {
+            case UELF_PT_NULL:    type_name = "NULL"; break;
+            case UELF_PT_LOAD:    type_name = "LOAD"; break;
+            case UELF_PT_DYNAMIC: type_name = "DYNAMIC"; break;
+            case UELF_PT_INTERP:  type_name = "INTERP"; break;
+            case UELF_PT_NOTE:    type_name = "NOTE"; break;
+            case UELF_PT_SHLIB:   type_name = "SHLIB"; break;
+            case UELF_PT_PHDR:    type_name = "PHDR"; break;
+            case UELF_PT_TLS:     type_name = "TLS"; break;
+            default:          type_name = "OTHER"; break;
+        }
+
+        uELF_INFO("  [%2d] %-14s %06lx %08lx %08lx %06lx %06lx %3x %5lu",
+            i,
+            type_name,
+            phdrs[i].p_offset,
+            phdrs[i].p_vaddr,
+            phdrs[i].p_paddr,
+            phdrs[i].p_filesz,
+            phdrs[i].p_memsz,
+            phdrs[i].p_flags,
+            phdrs[i].p_align
+        );
+    }
+}
+
 
 int main(int argc, char **argv) {
   if (argc < 2) {
@@ -315,6 +423,10 @@ int main(int argc, char **argv) {
   uELF64_print_sections(&elf_file);
 
   uELF64_print_symbols(&elf_file);
+
+  uELF64_parse_programs(&elf_file);
+  uELF64_print_programs(&elf_file);
+  uELF64_print_map_sections_to_segments(&elf_file);
 
 close:
   uElf64_close(&elf_file);
