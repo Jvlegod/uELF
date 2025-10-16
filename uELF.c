@@ -1,9 +1,10 @@
 #include "uELF.h"
 #include "uELF_log.h"
 #include "uELF_loader.h"
+#include "uELF_linker.h"
 
 // open file and read ELF header
-static int uElf64_open(const char *name, uElf64_File *elf_file) {
+int uElf64_open(const char *name, uElf64_File *elf_file) {
   int fd = open(name, O_RDWR);
   if (fd < 0) {
     uELF_ERROR("Failed to open file: %s", name);
@@ -29,7 +30,7 @@ static int uElf64_open(const char *name, uElf64_File *elf_file) {
   return fd;
 }
 
-static int uElf64_close(uElf64_File *elf_file) {
+int uElf64_close(uElf64_File *elf_file) {
   if (elf_file->fd >= 0) {
 	  close(elf_file->fd);
 	  elf_file->fd = -1;
@@ -66,7 +67,7 @@ static int uElf64_close(uElf64_File *elf_file) {
   return 0;
 }
 
-static int uELF64_parse_sections(uElf64_File *elf_file) {
+int uELF64_parse_sections(uElf64_File *elf_file) {
   uElf64_Ehdr *ehdr = &elf_file->elf_header;
   int fd = elf_file->fd;
 
@@ -186,7 +187,7 @@ static int uELF64_parse_sections(uElf64_File *elf_file) {
   return 0;
 }
 
-static int uELF64_parse_programs(uElf64_File *elf_file) {
+int uELF64_parse_programs(uElf64_File *elf_file) {
   uElf64_Ehdr *ehdr = &elf_file->elf_header;
   int fd = elf_file->fd;
 
@@ -261,19 +262,24 @@ static int uELF64_print_map_sections_to_segments(uElf64_File *elf_file) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    printf("Usage: %s [--load|-l|--print|-p] <elf-file> [symbol]\n", argv[0]);
+    printf("Usage: %s [--load|-l|--print|-p|--link] ...\n", argv[0]);
     return -1;
   }
 
   if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-    printf("Usage: %s [--load|-l|--print|-p] <elf-file> [symbol]\n", argv[0]);
+    printf("Usage: %s --print <elf-file> [(-r|-s|-h|-p|-S|-m)]\n", argv[0]);
+    printf("       %s --load <elf-file> [symbol]\n", argv[0]);
+    printf("       %s --link <output> <entry-symbol> <object> [object...]\n", argv[0]);
     return 0;
   }
 
   int mode = 0;
   const char *entry_symbol = NULL;
+  const char *output_path = NULL;
   const char *path = NULL;
   const char *addend = NULL;
+  const char **link_inputs = NULL;
+  int link_count = 0;
 
   if (strcmp(argv[1], "--load") == 0 || strcmp(argv[1], "-l") == 0) {
     mode = 1; // LOAD
@@ -301,13 +307,28 @@ int main(int argc, char **argv) {
     } else if (argc == 3) {
       path = argv[2];
     } else {
-      printf("Usage: %s [--load|-l|--print|-p] <elf-file> [symbol]\n", argv[0]);
+      printf("Usage: %s --print <elf-file> [(-r|-s|-h|-p|-S|-m)]\n", argv[0]);
       return -1;
     }
+  } else if (strcmp(argv[1], "--link") == 0) {
+    mode = 3; // LINK
+    if (argc < 5) {
+      uELF_ERROR("Usage: %s --link <output> <entry-symbol> <object> [object...]", argv[0]);
+      return -1;
+    }
+    output_path = argv[2];
+    entry_symbol = argv[3];
+    link_inputs = (const char **)&argv[4];
+    link_count = argc - 4;
   } else {
     uELF_ERROR("Unknown option: %s", argv[1]);
     return -1;
   }
+
+  if (mode == 3) {
+    return uELF64_link_objects(output_path, entry_symbol, link_inputs, link_count);
+  }
+
 
   uElf64_File elf_file;
   memset(&elf_file, 0, sizeof(elf_file));

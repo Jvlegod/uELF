@@ -320,6 +320,38 @@ static int uELF64_x86_64_relocate(uElf64_File *elf_file, uElf64_Rela *relocs, si
         }
         *(uint64_t *)target = value + rela->r_addend;
         break;
+      case UELF_R_X86_64_PC32:
+      case UELF_R_X86_64_PLT32:
+        if (!sym) {
+          uELF_ERROR("Relocation requires symbol but none provided (index %u)", sym_index);
+          free(relocs);
+          return -1;
+        }
+        if (uELF64_resolve_symbol_address(elf_file, sym, name, &value) < 0) {
+          free(relocs);
+          return -1;
+        }
+        {
+          int64_t rel = (int64_t)(value + rela->r_addend - target);
+          *(int32_t *)target = (int32_t)rel;
+        }
+        break;
+      case UELF_R_X86_64_32:
+      case UELF_R_X86_64_32S:
+        if (!sym) {
+          uELF_ERROR("Relocation requires symbol but none provided (index %u)", sym_index);
+          free(relocs);
+          return -1;
+        }
+        if (uELF64_resolve_symbol_address(elf_file, sym, name, &value) < 0) {
+          free(relocs);
+          return -1;
+        }
+        if (type == UELF_R_X86_64_32S)
+          *(int32_t *)target = (int32_t)(value + rela->r_addend);
+        else
+          *(uint32_t *)target = (uint32_t)(value + rela->r_addend);
+        break;
       case UELF_R_X86_64_NONE:
         break;
       default:
@@ -328,6 +360,7 @@ static int uELF64_x86_64_relocate(uElf64_File *elf_file, uElf64_Rela *relocs, si
         break;
     }
   }
+  return 0;
 }
 
 static int uELF64_arch_relocate(uElf64_File *elf_file, uElf64_Rela *relocs, size_t count,
