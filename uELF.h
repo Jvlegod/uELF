@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <stdbool.h>
+#include <limits.h>
 
 
 typedef enum {
@@ -84,6 +86,10 @@ typedef struct {
 #define UELF64_R_SYM(i) ((uint32_t)((i) >> 32))
 #define UELF64_R_TYPE(i) ((uint32_t)(i))
 
+#define UELF_SHF_WRITE      0x1
+#define UELF_SHF_ALLOC      0x2
+#define UELF_SHF_EXECINSTR  0x4
+
 #define UELF64_ST_BIND(i) ((uint8_t)((i) >> 4))
 #define UELF64_ST_TYPE(i) ((uint8_t)((i) & 0xf))
 
@@ -92,12 +98,18 @@ typedef struct {
 #define UELF_STB_WEAK   2
 
 #define UELF_SHN_UNDEF 0
+#define UELF_SHN_ABS   0xfff1
+#define UELF_SHN_COMMON 0xfff2
 
 #define UELF_R_X86_64_NONE      0
 #define UELF_R_X86_64_64        1
+#define UELF_R_X86_64_PC32      2
+#define UELF_R_X86_64_PLT32     4
 #define UELF_R_X86_64_GLOB_DAT  6
 #define UELF_R_X86_64_JUMP_SLOT 7
 #define UELF_R_X86_64_RELATIVE  8
+#define UELF_R_X86_64_32        10
+#define UELF_R_X86_64_32S       11
 
 typedef struct {
     uint32_t p_type;   // 段类型 (Segment type)
@@ -227,3 +239,8 @@ static uint64_t uelf_align_down(uint64_t value, uint64_t alignment) {
 static uint64_t uelf_align_up(uint64_t value, uint64_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
+
+int uElf64_open(const char *name, uElf64_File *elf_file);
+int uElf64_close(uElf64_File *elf_file);
+int uELF64_parse_sections(uElf64_File *elf_file);
+int uELF64_parse_programs(uElf64_File *elf_file);
