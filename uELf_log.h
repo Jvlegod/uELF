@@ -25,7 +25,7 @@ static inline void uELF_log_base(
     char buf[20];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
 
-    fprintf(stderr, "%s[%s] %s%-5s%s (%s:%d) ",
+    fprintf(stderr, "%s %s%s%-5s%s (%s:%d) ",
             buf,
             color, level,
             "", CLR_RESET,

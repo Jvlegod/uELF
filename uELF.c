@@ -304,6 +304,107 @@ static int uELF64_print_symbols(uElf64_File *elf_file) {
   return 0;
 }
 
+static int uELF64_print_relocations(uElf64_File *elf_file) {
+  uElf64_Ehdr *ehdr = &elf_file->elf_header;
+  uElf64_Shdr *shdrs = elf_file->section_headers;
+  char *shstrtab = elf_file->shstrtab;
+  
+  int sym_type = -1;
+  int found = 0;
+
+  if (!shdrs) {
+    uELF_WARN("No section headers found, cannot print relocations.");
+    return -1;
+  }
+
+  for (int i = 0; i < ehdr->e_shnum; i++) {
+    uElf64_Shdr *sh = &shdrs[i];
+    uElf64_Sym *sym = NULL;
+
+    // 只打印 SHT_RELA 或 SHT_REL 类型的节
+    if (sh->sh_type != UELF_SHT_RELA && sh->sh_type != UELF_SHT_REL)
+      continue;
+
+    found = 1;
+    const char *sec_name = shstrtab ? &shstrtab[sh->sh_name] : "(unknown)";
+    size_t entry_count = sh->sh_entsize ? (sh->sh_size / sh->sh_entsize)
+                                        : 0;
+    if (entry_count == 0)
+      continue;
+
+    uELF_INFO("Relocation section '%s' (type=%s) at offset 0x%lx contains %lu sh_link: %lu entries:",
+              sec_name,
+              (sh->sh_type == UELF_SHT_RELA) ? "RELA" : "REL",
+              (unsigned long)sh->sh_offset,
+              (unsigned long)entry_count,
+              (unsigned long)sh->sh_link);
+
+    // 读取整个节内容
+    void *buf = malloc(sh->sh_size);
+    if (!buf) {
+      uELF_ERROR("Failed to allocate memory for relocation section '%s'", sec_name);
+      continue;
+    }
+
+    if (pread(elf_file->fd, buf, sh->sh_size, sh->sh_offset) != (ssize_t)sh->sh_size) {
+      uELF_ERROR("Failed to read relocation section '%s'", sec_name);
+      free(buf);
+      continue;
+    }
+
+    // 遍历每个 relocation 条目
+    for (size_t j = 0; j < entry_count; j++) {
+      if (sh->sh_type == UELF_SHT_RELA) {
+        uElf64_Rela *rela = &((uElf64_Rela *)buf)[j];
+        uint32_t sym_index = UELF64_R_SYM(rela->r_info);
+        uint32_t type = UELF64_R_TYPE(rela->r_info);
+        // 处理符号名称
+        if (strcmp(&elf_file->shstrtab[shdrs[sh->sh_link].sh_name], ".dynsym") == 0) {
+          sym = (uElf64_Sym *)(elf_file->dynsym + sym_index * sizeof(uElf64_Sym));
+          sym_type = 1;
+        } else {
+          sym = (uElf64_Sym *)(elf_file->symtab + sym_index * sizeof(uElf64_Sym));
+          sym_type = 0;
+        }
+        uELF_INFO("  [%3lu] Offset: 0x%016lx  Info: 0x%016lx  Addend: %ld  Sym: %u  Name: %s  Type: %u",
+                  j,
+                  rela->r_offset,
+                  rela->r_info,
+                  rela->r_addend,
+                  sym_index,
+                  sym_type == 1 ? &elf_file->dynstr[sym->st_name] : &elf_file->strtab[sym->st_name],
+                  type);
+      } else {
+        uElf64_Rel *rel = &((uElf64_Rel *)buf)[j];
+        uint32_t sym_index = UELF64_R_SYM(rel->r_info);
+        uint32_t type = UELF64_R_TYPE(rel->r_info);
+        // 处理符号名称
+        if (strcmp(&elf_file->shstrtab[shdrs[sh->sh_link].sh_name], ".dynsym") == 0) {
+          sym = (uElf64_Sym *)(elf_file->dynsym + sym_index * sizeof(uElf64_Sym));
+          sym_type = 1;
+        } else {
+          sym = (uElf64_Sym *)(elf_file->symtab + sym_index * sizeof(uElf64_Sym));
+          sym_type = 0;
+        }
+        uELF_INFO("  [%3lu] Offset: 0x%016lx  Info: 0x%016lx  Sym: %u  Name: %s  Type: %u",
+                  j,
+                  rel->r_offset,
+                  rel->r_info,
+                  sym_index,
+                  sym_type == 1 ? &elf_file->dynstr[sym->st_name] : &elf_file->strtab[sym->st_name],
+                  type);
+      }
+    }
+
+    free(buf);
+  }
+
+  if (!found)
+    uELF_INFO("No relocation sections found.");
+
+  return 0;
+}
+
 static int uELF64_parse_programs(uElf64_File *elf_file) {
   uElf64_Ehdr *ehdr = &elf_file->elf_header;
   int fd = elf_file->fd;
@@ -719,6 +820,7 @@ static int uELF64_x86_64_relocate(uElf64_File *elf_file, uElf64_Rela *relocs, si
           free(relocs);
           return -1;
         }
+        // 用来解决特殊的符号处理问题.
         if (uELF64_resolve_symbol_address(elf_file, sym, name, &value) < 0) {
           free(relocs);
           return -1;
@@ -877,12 +979,13 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  int load_mode = 0;
+  int mode = 0;
   const char *entry_symbol = NULL;
   const char *path = NULL;
+  const char *addend = NULL;
 
   if (strcmp(argv[1], "--load") == 0 || strcmp(argv[1], "-l") == 0) {
-    load_mode = 1;
+    mode = 1; // LOAD
     if (argc < 3) {
       uELF_ERROR("Missing ELF file path for load mode");
       return -1;
@@ -895,13 +998,20 @@ int main(int argc, char **argv) {
       uELF_WARN("Ignoring extra arguments after symbol name");
     }
   } else if (strcmp(argv[1], "--print") == 0 || strcmp(argv[1], "-p") == 0) {
+    mode = 2; // PRINT
     if (argc < 3) {
       uELF_ERROR("Missing ELF file path for print mode");
       return -1;
     }
-    path = argv[2];
-    if (argc > 3) {
-      uELF_WARN("Ignoring extra arguments in print mode");
+    
+    if (argc == 4) {
+      path = argv[3];
+      addend = argv[2];
+    } else if (argc == 3) {
+      path = argv[2];
+    } else {
+      printf("Usage: %s [--load|-l|--print|-p] <elf-file> [symbol]\n", argv[0]);
+      return -1;
     }
   } else {
     uELF_ERROR("Unknown option: %s", argv[1]);
@@ -919,7 +1029,6 @@ int main(int argc, char **argv) {
 
   int ret = 0;
 
-  
   if (uELF64_parse_sections(&elf_file) < 0) {
     ret = -1;
     goto close;
@@ -931,16 +1040,37 @@ int main(int argc, char **argv) {
     goto close;
   }
 
-  if (strcmp(argv[1], "--print") == 0 || strcmp(argv[1], "-p") == 0) {
-    uELF64_print_header(&elf_file);
-    uELF64_print_sections(&elf_file);
-    uELF64_print_symbols(&elf_file);
-    uELF64_print_programs(&elf_file);
-    uELF64_print_map_sections_to_segments(&elf_file);
+  if (mode == 2) {
+    if (addend == NULL) {
+      uELF64_print_header(&elf_file);
+      uELF64_print_sections(&elf_file);
+      uELF64_print_symbols(&elf_file);
+      uELF64_print_programs(&elf_file);
+      uELF64_print_relocations(&elf_file);
+      uELF64_print_map_sections_to_segments(&elf_file);
+      goto close;
+    }
+
+    if (strcmp(addend, "-r") == 0) {
+      uELF64_print_relocations(&elf_file);      
+    } else if (strcmp(addend, "-s") == 0) {
+      uELF64_print_symbols(&elf_file);
+    } else if (strcmp(addend, "-p") == 0) {
+      uELF64_print_programs(&elf_file);
+    } else if (strcmp(addend, "-m") == 0) {
+      uELF64_print_map_sections_to_segments(&elf_file);
+    } else if (strcmp(addend, "-S") == 0) {
+      uELF64_print_sections(&elf_file);
+    } else if (strcmp(addend, "-h") == 0) {
+      uELF64_print_header(&elf_file);
+    } else {
+      uELF_ERROR("Unknown print option: %s", addend);
+      ret = -1;
+    }
     goto close;
   }
 
-  if (load_mode) {
+  if (mode == 1) {
     if (uELF64_load_segments(&elf_file) == 0) {
       uELF_INFO("ELF entry point: 0x%lx", elf_file.elf_header.e_entry);
       if (uELF64_apply_relocations(&elf_file) < 0) {

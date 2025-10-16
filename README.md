@@ -11,7 +11,8 @@
 ## 2 基本用法
 
 ```bash
-./uelf -p <elf-file>
+# ./uelf --print <elf-file>
+./uelf -p [-r|-s|-h|-p|-S|-m] <elf-file>
 ```
 
 这对于调试或了解 ELF 文件结构非常有用.

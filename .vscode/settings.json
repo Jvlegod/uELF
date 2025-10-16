@@ -19,6 +19,7 @@
         "random": "c",
         "compare": "c",
         "bitset": "c",
-        "algorithm": "c"
+        "algorithm": "c",
+        "exception": "c"
     }
 }

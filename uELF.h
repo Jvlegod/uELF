@@ -67,6 +67,11 @@ typedef struct {
   int64_t r_addend;
 } uElf64_Rela;
 
+typedef struct {
+  uint64_t r_offset;
+  uint64_t r_info;
+} uElf64_Rel;
+
 #define UELF64_R_SYM(i) ((uint32_t)((i) >> 32))
 #define UELF64_R_TYPE(i) ((uint32_t)(i))
 
